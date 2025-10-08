@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict
 from app import models, db
 from app.alert.config import ALERT_CONFIG, NOTIF_METHODS
 
