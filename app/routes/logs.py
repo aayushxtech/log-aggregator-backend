@@ -74,6 +74,15 @@ def delete_log(log_id: int, db: Session = Depends(get_db)):
     log = db.query(models.Log).filter(models.Log.id == log_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="Log not found")
+    # Build return payload before deleting (so response_model matches)
+    deleted_payload = {
+        "id": log.id,
+        "level": log.level,
+        "service": log.service,
+        "message": log.message,
+        "timestamp": log.timestamp,
+        "metadata_": log.metadata_,
+    }
     db.delete(log)
     db.commit()
-    return {"message": f"Log {log_id} deleted successfully"}
+    return deleted_payload

@@ -18,8 +18,8 @@ class LogRead(LogBase):
     id: int
     timestamp: datetime
 
-    class Config:
-        orm_mode = True
+    # Pydantic v2: use from_attributes to allow ORM -> model conversion
+    model_config = {"from_attributes": True}
 
 
 class StatsResponse(BaseModel):
