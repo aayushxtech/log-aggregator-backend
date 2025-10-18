@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Mapping, List
+from typing import Optional, Dict, Mapping, List, Any
 from datetime import datetime
 
 
@@ -22,10 +22,11 @@ class LogBase(BaseModel):
     level: str
     message: str
     timestamp: Optional[datetime] = None
-    metadata_: Optional[Mapping[str, str]] = None
+    metadata_: Optional[Mapping[str, Any]] = None
     service: str
-    app_id: int
-    app: str
+    # apps can be identified by id or name — make both optional for input
+    app_id: Optional[int] = None
+    app: Optional[str] = None
 
 
 class LogCreate(LogBase):
