@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.routes import logs, statistics, bulk_logs, app as apps_router
+from app.routes import logs, statistics, bulk_logs, app as apps_router, ingest
 import asyncio
 from contextlib import asynccontextmanager
 from app.alert.alert_system import check_alerts
@@ -56,6 +56,9 @@ app.include_router(bulk_logs.router)
 
 # Apps
 app.include_router(apps_router.router)
+
+# Ingest (high-throughput enqueue)
+app.include_router(ingest.router)
 
 
 @app.get("/")

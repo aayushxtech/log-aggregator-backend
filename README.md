@@ -1,245 +1,186 @@
 # Log Aggregator & Analytics API
 
-A lightweight FastAPI service for collecting, storing, and querying application logs with simple analytics.
+A lightweight FastAPI service for collecting, storing, and querying application logs with simple analytics and a durable ingest path (Redis Streams + worker).
 
-- Project location: /home/aayushxtech/Project/aoop-project/log_aggregator
-- Python: tested with Python 3.13
-- Frameworks / major deps: FastAPI, SQLAlchemy, Pydantic, Uvicorn, python-dotenv  
-  See: `requirements.txt`
+Python: tested with Python 3.13  
+See dependencies in: requirements.txt
 
-Contents
+Contents (notable files)
 
 - app/main.py — application bootstrap and router registration ([app/main.py](app/main.py))
 - app/routes/logs.py — CRUD and filter endpoints for logs ([app/routes/logs.py](app/routes/logs.py))
-- app/routes/bulk_logs.py — bulk insert endpoint ([app/routes/bulk_logs.py](app/routes/bulk_logs.py))
-- app/routes/statistics.py — aggregated statistics endpoint ([app/routes/statistics.py](app/routes/statistics.py))
-- app/models.py — SQLAlchemy ORM model `Log` ([app/models.py](app/models.py))
-- app/schemas.py — Pydantic request/response schemas ([app/schemas.py](app/schemas.py))
+- app/routes/bulk_logs.py — synchronous bulk insert to DB ([app/routes/bulk_logs.py](app/routes/bulk_logs.py))
+- app/routes/ingest.py — fast async ingest endpoint that enqueues to Redis Stream ([app/routes/ingest.py](app/routes/ingest.py))
+- app/ingest/worker.py — Redis Stream consumer that batches & persists to DB ([app/ingest/worker.py](app/ingest/worker.py))
+- app/routes/statistics.py — aggregated statistics ([app/routes/statistics.py](app/routes/statistics.py))
+- app/routes/app.py — register/manage apps ([app/routes/app.py](app/routes/app.py))
+- app/models.py — SQLAlchemy models `Log` and `App` ([app/models.py](app/models.py))
+- app/schemas.py — Pydantic schemas (LogCreate/LogRead/App* etc) ([app/schemas.py](app/schemas.py))
 - app/db.py — DB engine, SessionLocal and Base ([app/db.py](app/db.py))
-- app/init_db.py — helper to create tables ([app/init_db.py](app/init_db.py))
-- app/config.py — loads environment variables (DATABASE_URL) ([app/config.py](app/config.py))
-- .env — DB connection (not tracked) (.env)
-- .gitignore — recommended ignores (.gitignore)
+- app/init_db.py — create DB tables helper ([app/init_db.py](app/init_db.py))
+- app/config.py — loads .env variables ([app/config.py](app/config.py))
+- .env — local env (not tracked)
 
-Quick setup
+Design summary
 
-1. Create and activate a virtual environment (Linux):
+- Producers call POST /api/v1/ingest/ (fast, async). The ingest endpoint enqueues messages into a Redis Stream (STREAM_NAME) and returns immediately with an ack.
+- A separate worker (python -m app.ingest.worker) consumes the Redis Stream in batches, validates messages with Pydantic, resolves/creates apps, and persists logs using the bulk writer. Failed/invalid messages are moved to a DLQ stream.
+- If Redis is unavailable the ingest endpoint falls back to synchronous bulk insert to the DB.
+- CRUD and query endpoints remain available for admin/low-volume use.
 
-   ```zsh
+Environment / .env
+Create a `.env` in the project root (no surrounding quotes, no spaces):
+
+```zsh
+DATABASE_URL=postgresql://user:pass@host:port/dbname?sslmode=require
+REDIS_URL=redis://localhost:6379/0
+CORS_ORIGINS=http://localhost:3000
+```
+
+See [app/config.py](app/config.py) for loading behavior.
+
+Quick setup (dev)
+
+1. Clone and enter project root:
+   cd /home/aayushxtech/Project/aoop-project/log_aggregator
+
+2. Create & activate venv:
    python3.13 -m venv .venv
    source .venv/bin/activate
+
+3. Install deps:
    pip install -r requirements.txt
-   ```
 
-2. Configure the database connection in `.env` at project root. Use a clean key/value format (no surrounding quotes, no spaces):
+4. Ensure .env is configured (see above).
 
-   ```.env
-   DATABASE_URL=postgresql://user:pass@host:port/dbname?sslmode=require
-   ```
-
-   See [app/config.py](app/config.py) for how the value is loaded.
-
-3. Initialize database tables:
-   - From project root:
-
-     ```zsh
-     cd /home/aayushxtech/Project/aoop-project/log_aggregator
-     python3.13 -m app.init_db
-     ```
-
-   This calls [`app/init_db.py`](app/init_db.py) which runs `Base.metadata.create_all(bind=engine)` where `Base` and `engine` come from [`app/db.py`](app/db.py).
+5. Initialize DB tables:
+   python -m app.init_db
 
 Run the app (development)
 
-- From project root:
-
-  ```zsh
+- Start API:
   uvicorn app.main:app --reload --port 8000
-  ```
+- Interactive docs: http://127.0.0.1:8000/docs
 
-- Open interactive docs: http://127.0.0.1:8000/docs
+Primary HTTP endpoints
 
-Primary endpoints
+- POST /api/v1/ingest/ — fast enqueue (JSON array or NDJSON) to Redis stream (preferred for producers). See [app/routes/ingest.py](app/routes/ingest.py).
+- POST /api/v1/logs/ — create single log (sync, creates App if needed). See [app/routes/logs.py](app/routes/logs.py).
+- POST /api/v1/bulk_logs/ — synchronous bulk insert (admin/low-volume). See [app/routes/bulk_logs.py](app/routes/bulk_logs.py).
+- GET /api/v1/logs/ and /api/v1/logs/filter — query logs.
+- GET /api/v1/stats/ — aggregated counts.
 
-- Create log: POST /api/v1/logs/ ([app/routes/logs.py](app/routes/logs.py))  
-- Read logs / filter: GET /api/v1/logs/ and /api/v1/logs/filter
-- Read single log: GET /api/v1/logs/{log_id}
-- Delete log: DELETE /api/v1/logs/{log_id} — note: current implementation returns a message string but the route is declared with response_model=LogRead; see "Known issues".
-- Bulk insert: POST /api/v1/bulk_logs/ ([app/routes/bulk_logs.py](app/routes/bulk_logs.py))
-- Stats: GET /api/v1/stats/ ([app/routes/statistics.py](app/routes/statistics.py))
+Worker / queue details
 
-Schemas and model notes
+- Ingest stream: default `logs:stream` (INGEST_STREAM env var).
+- Consumer group: default `ingest-group` (INGEST_GROUP).
+- DLQ: default `logs:dlq` for invalid/failed messages.
+- Worker entrypoint: python -m app.ingest.worker — it:
+  - Creates/ensures consumer group, processes any existing pending messages, then reads new messages (xreadgroup).
+  - Validates items with schemas.LogCreate and calls bulk_logs.create_bulk_logs to persist.
+  - Acks messages only after successful processing; failed messages are moved to DLQ.
 
-- Pydantic schemas: [`app/schemas.py`](app/schemas.py)
-  - LogCreate — input for create
-  - LogRead — output (orm_mode enabled)
-  - StatsResponse — aggregates (total_logs, by_level, by_service)
-- ORM model: [`app/models.py`](app/models.py)
-  - Field `metadata_` maps to a JSON column; intentionally named `metadata_` to avoid colliding with SQLAlchemy Declarative's reserved attribute `metadata`.
+Known caveats / recommendations (MVP vs production)
 
-Known issues
+- Redis persistence: enable AOF and mount a volume for Redis in production (docker-compose example below uses appendonly).
+- Idempotency: producers should include an idempotency or trace id in metadata_ if dedupe is required; worker does not currently dedupe.
+- Bulk persistence performance: current implementation uses SQLAlchemy ORM add_all; for very-high-throughput switch to COPY or bulk_insert_mappings.
+- Consumer-group startup: worker handles pending messages on startup; if you recreate the group manually you may need id=0 to pick up pre-existing messages.
+- Security: add API keys / rate-limiting if exposing ingest endpoint publicly.
 
-- .env formatting: do not include surrounding quotes or spaces around `DATABASE_URL` — use `KEY=VALUE`.
-- Reserved attribute collision: do not name model attributes `metadata` (SQLAlchemy reserves it). The repo uses `metadata_` to avoid the conflict. See [`app/models.py`](app/models.py) and [`app/schemas.py`](app/schemas.py).
-- Delete endpoint mismatch: [`app/routes/logs.py`](app/routes/logs.py) declares `response_model=LogRead` but returns a message dict. Either change response_model or return the deleted object.
-- DB engine: [`app/db.py`](app/db.py) uses `declarative_base()` from `sqlalchemy.ext.declarative` — consider switching to `from sqlalchemy.orm import declarative_base` for SQLAlchemy 2.x compatibility.
+Docker-compose (example)
+Place a docker-compose.yml at project root to run Redis + api + worker (sample):
 
-## API Reference
+```yaml
+version: "3.8"
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
 
-Base URL (development)
-- http://127.0.0.1:8000
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
 
-Interactive docs
-- Swagger UI: GET /docs
-- OpenAPI JSON: GET /openapi.json
+  worker:
+    build: .
+    command: python -m app.ingest.worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+    depends_on:
+      - redis
+      - api
 
-All routes are prefixed where indicated. Request/response examples assume JSON and ISO8601 timestamps with timezone (e.g. 2025-10-09T12:34:56+00:00).
+volumes:
+  redis-data:
+```
 
----
+Demo — end-to-end (quick steps)
 
-### Root
-- GET /
-  - Purpose: health / welcome
-  - Response 200:
-    ```json
-    { "message": "Log Aggregation Service is up and running" }
-    ```
+1. Start Redis (Docker):
+   docker run -d --name redis -p 6379:6379 -v redis-data:/data redis:7-alpine redis-server --appendonly yes
 
-### Logs (prefix: /api/v1/logs)
+2. Ensure .env is set and install deps (see Quick setup).
 
-- POST /api/v1/logs/
-  - Purpose: create a single log
-  - Request body (LogCreate):
-    ```json
-    {
-      "level": "ERROR",
-      "message": "Something went wrong",
-      "timestamp": "2025-10-09T12:34:56+00:00",
-      "metadata_": {"request_id": "abc"},
-      "service": "payment-service"
-    }
-    ```
-  - Response 200 (LogRead):
-    ```json
-    {
-      "id": 1,
-      "level": "ERROR",
-      "message": "Something went wrong",
-      "timestamp": "2025-10-09T12:34:56+00:00",
-      "metadata_": {"request_id": "abc"}
-    }
-    ```
-  - Notes: `LogRead` currently omits `service` from its declared fields; include `service` in responses by adding it to `LogRead` if required.
+3. Initialize DB tables:
+   python -m app.init_db
 
-- GET /api/v1/logs/
-  - Purpose: list logs with pagination
-  - Query params:
-    - skip: int (default 0)
-    - limit: int (default 50)
-  - Response 200: List[LogRead]
-  - Example:
-    ```
-    GET /api/v1/logs?skip=0&limit=25
-    ```
+4. Start API server (terminal A):
+   uvicorn app.main:app --reload --port 8000
 
-- GET /api/v1/logs/{log_id}
-  - Purpose: fetch a single log by id
-  - Path param: log_id (int)
-  - Response:
-    - 200 LogRead on success
-    - 404 if not found
+5. Start worker (terminal B):
+   python -m app.ingest.worker
 
-- GET /api/v1/logs/filter
-  - Purpose: query logs with filters
-  - Query params (all optional):
-    - level: string (exact match)
-    - service: string (exact match)
-    - start_time: datetime (ISO8601)
-    - end_time: datetime (ISO8601)
-    - skip: int
-    - limit: int
-  - Response 200: List[LogRead]
-  - Example:
-    ```
-    GET /api/v1/logs/filter?level=ERROR&service=payment-service&start_time=2025-10-09T00:00:00Z&end_time=2025-10-10T00:00:00Z
-    ```
-  - Common 422 cause: unparseable `start_time`/`end_time` formats — use ISO8601 with timezone.
+6. Enqueue test logs (producer):
+   - JSON array:
+     curl -i -X POST "http://127.0.0.1:8000/api/v1/ingest/" \
+       -H "Content-Type: application/json" \
+       -d '[{"level":"INFO","message":"demo log","service":"svc","app":"demo"}]'
 
-- DELETE /api/v1/logs/{log_id}
-  - Purpose: delete a log and return the deleted record
-  - Path param: log_id (int)
-  - Response:
-    - 200 LogRead (deleted record)
-    - 404 if not found
+   - NDJSON:
+     printf '{"level":"INFO","message":"a","service":"s","app":"demo"}\n{"level":"ERROR","message":"b","service":"s","app":"demo"}\n' \
+       | curl -i -X POST "http://127.0.0.1:8000/api/v1/ingest/" -H "Content-Type: application/x-ndjson" --data-binary @-
 
----
+   Expected response: {"enqueued": N, "backend": "redis"} (or backend:"db" if Redis unavailable)
 
-### Bulk insert (prefix: /api/v1/bulk_logs)
+7. Verify Redis stream (optional):
+   docker exec -it redis redis-cli XLEN logs:stream
+   docker exec -it redis redis-cli XRANGE logs:stream - +
+   docker exec -it redis redis-cli XLEN logs:dlq
 
-- POST /api/v1/bulk_logs/
-  - Purpose: insert multiple logs in a single request
-  - Request body: JSON array of LogCreate objects
-  - Response 200: JSON array of LogRead objects (created records)
-  - Example:
-    ```json
-    [
-      {
-        "level": "INFO",
-        "message": "start",
-        "timestamp": "2025-10-09T12:00:00+00:00",
-        "metadata_": null,
-        "service": "payment-service"
-      },
-      {
-        "level": "ERROR",
-        "message": "failure",
-        "timestamp": "2025-10-09T12:01:00+00:00",
-        "metadata_": {"code": "E123"},
-        "service": "payment-service"
-      }
-    ]
-    ```
+8. After worker processes messages, verify persisted logs:
+   curl -sL "http://127.0.0.1:8000/api/v1/logs/?app=demo" | jq .
 
----
+9. If stream messages remain after starting the worker:
+   # recreate group to read from start and restart worker
+   docker exec -it redis redis-cli XGROUP DESTROY logs:stream ingest-group || true
+   docker exec -it redis redis-cli XGROUP CREATE logs:stream ingest-group 0 MKSTREAM
+   python -m app.ingest.worker
 
-### Statistics (prefix: /api/v1/stats)
+Developer notes & tests
 
-- GET /api/v1/stats/
-  - Purpose: aggregated counts of logs
-  - Response model (StatsResponse):
-    ```json
-    {
-      "total_logs": 123,
-      "by_level": {"ERROR": 10, "INFO": 100},
-      "by_service": {"payment-service": 50, "auth-service": 73}
-    }
-    ```
-  - Notes: counts are computed from stored logs; timestamps are considered in queries used by the alert system.
+- Unit test example for bulk ingestion added under tests/test_bulk_logs.py (use sqlite in-memory for CI).
+- Monitor Redis: XLEN logs:stream, XPENDING logs:stream ingest-group, XLEN logs:dlq.
+- To run tests:
+  pip install pytest
+  python -m pytest -q
 
----
+Contact / next improvements
 
-### Alerts (background, not HTTP)
-- The alert system runs as a background task (enabled by default, controlled via ENABLE_ALERTS env var).
-- Configurable in: app/alert/config.py (ALERT_CONFIG). Example entry:
-  ```py
-  "ERROR": {"threshold": 10, "interval_sec": 60}
-  ```
-- Cross-process deduplication requires Redis (set REDIS_URL); otherwise dedupe is per-process.
-
----
-
-### Useful developer notes
-- .env formatting: keys must be KEY=VALUE with no surrounding quotes. Example:
-  ```
-  DATABASE_URL=postgresql://user:pass@host:port/dbname?sslmode=require
-  CORS_ORIGINS=http://localhost:3000,http://your-frontend.example.com
-  ENABLE_ALERTS=true
-  REDIS_URL=redis://localhost:6379/0
-  ```
-- Use uvicorn to run:
-  ```
-  uvicorn app.main:app --reload --port 8000
-  ```
-  For production use a process manager and enable Redis-based dedupe if running multiple workers.
-
-If you want, I can produce a machine-readable OpenAPI snippet trimmed to only the endpoints you want to show on the dashboard.
+- Add API key auth and rate-limiting.
+- Replace ORM bulk insert with COPY for higher throughput.
+- Add Prometheus metrics for stream lag and worker latencies.
+- Containerize worker and run under orchestration (Kubernetes / systemd) for reliability.
