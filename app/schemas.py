@@ -1,24 +1,42 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Mapping
+from typing import Optional, Dict, Mapping, List
 from datetime import datetime
+
+
+class AppBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class AppCreate(AppBase):
+    pass
+
+
+class AppRead(AppBase):
+    id: int
+
+    model_config = {"from_attributes": True}
 
 
 class LogBase(BaseModel):
     level: str
     message: str
-    timestamp: datetime
-    metadata_: Optional[Dict[str, str]] = None
+    timestamp: Optional[datetime] = None
+    metadata_: Optional[Mapping[str, str]] = None
+    service: str
+    app_id: int
+    app: str
 
 
 class LogCreate(LogBase):
-    service: str
+    # timestamp optional: DB can default to now()
+    timestamp: Optional[datetime] = None
 
 
 class LogRead(LogBase):
     id: int
-    timestamp: datetime
 
-    # Pydantic v2: use from_attributes to allow ORM -> model conversion
+    # allow ORM objects -> pydantic models (Pydantic v2)
     model_config = {"from_attributes": True}
 
 
