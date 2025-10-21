@@ -543,7 +543,7 @@ Every 5 seconds (background task):
 
 ```bash
 # Database (PostgreSQL)
-DATABASE_URL="postgresql://neondb_owner:npg_E5NJTd6QLtUA@ep-wispy-hall-adh5lmqv-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+DATABASE_URL=
 
 # Redis
 REDIS_URL=redis://localhost:6379/0
