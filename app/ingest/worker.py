@@ -2,9 +2,8 @@ import asyncio
 import json
 import os
 import uuid
+import redis.asyncio as aioredis  # type: ignore
 from typing import List
-
-import redis.asyncio as aioredis
 from sqlalchemy.orm import Session
 
 from app import db, schemas
@@ -20,122 +19,101 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
 async def ensure_group(r: aioredis.Redis):
+    """Ensure consumer group exists."""
     try:
-        await r.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
-    except Exception:
-        # group exists or creation failed — ignore
-        pass
+        await r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+        print(f"[worker] Created consumer group '{GROUP}'")
+    except aioredis.ResponseError as e:
+        if "BUSYGROUP" not in str(e):
+            print(f"[worker] Error creating group: {e}")
 
 
-async def process_batch(entries: List[tuple]):
+async def process_batch(entries: List[tuple], r: aioredis.Redis):
     """
+    Process and persist logs to DB.
     entries: list of tuples (msg_id, payload_dict)
-    Uses a DB session and reuses app.routes.bulk_logs.create_bulk_logs logic for persistence.
     """
     if not entries:
         return
 
-    items = [payload for _id, payload in entries]
+    # Extract and parse the 'data' field from each entry
+    items = []
+    for _id, payload in entries:
+        try:
+            # payload is like {"data": "{\"level\": \"INFO\", ...}"}
+            data_str = payload.get("data")
+            if isinstance(data_str, str):
+                data = json.loads(data_str)  # Parse the JSON string
+            else:
+                data = data_str
+            items.append(data)
+        except Exception as e:
+            print(f"[worker] Error parsing data field: {e}")
+            # Move to DLQ
+            await r.xadd(DLQ, {"error": f"Failed to parse data: {e}", "msg_id": _id})
+            continue
 
-    # Validate via Pydantic schema to ensure shape & types
-    try:
-        validated = [schemas.LogCreate(**it) for it in items]
-    except Exception as e:
-        # move invalid messages to DLQ with reason
-        r = aioredis.from_url(REDIS_URL, decode_responses=True)
-        for msg_id, payload in entries:
-            payload_with_err = {
-                "payload": json.dumps(payload), "error": str(e)}
-            await r.xadd(DLQ, payload_with_err)
+    if not items:
         return
 
+    # Validate
+    try:
+        validated = [schemas.LogCreate(**item) for item in items]
+    except Exception as e:
+        print(f"[worker] Validation error: {e}")
+        # Move to DLQ
+        for msg_id, _ in entries:
+            await r.xadd(DLQ, {"error": str(e), "msg_id": msg_id})
+        return
+
+    # Persist to DB
     session: Session = db.SessionLocal()
     try:
-        # call bulk insert helper (synchronous) passing session
         created = bulk_logs.create_bulk_logs(validated, db=session)
-        # created is list of created Log ORM objects
+        print(f"[worker] Successfully inserted {len(created)} logs to DB")
     except Exception as e:
-        # On DB failure push entries to DLQ with error
-        r = aioredis.from_url(REDIS_URL, decode_responses=True)
-        for msg_id, payload in entries:
-            await r.xadd(DLQ, {"payload": json.dumps(payload), "error": str(e)})
+        print(f"[worker] DB error: {e}")
+        # Move to DLQ
+        for msg_id, _ in entries:
+            await r.xadd(DLQ, {"error": str(e), "msg_id": msg_id})
     finally:
         session.close()
 
 
 async def consume_loop():
-    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    """Main consumer loop."""
+    r = await aioredis.from_url(REDIS_URL, decode_responses=True)
     await ensure_group(r)
 
-    # --- process any pending / pre-existing messages first (ID = 0) ---
-    try:
-        while True:
-            resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: "0"}, count=BATCH_SIZE, block=1000)
-            if not resp:
-                break
-            batch = []
-            ids_to_ack = []
-            for _stream, messages in resp:
-                for msg_id, fields in messages:
-                    raw = fields.get("data") or fields.get(b"data")
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        await r.xadd(DLQ, {"payload": raw, "error": "invalid_json"})
-                        await r.xack(STREAM, GROUP, msg_id)
-                        continue
-                    batch.append((msg_id, payload))
-                    ids_to_ack.append(msg_id)
-            if batch:
-                await process_batch(batch)
-                if ids_to_ack:
-                    await r.xack(STREAM, GROUP, *ids_to_ack)
-    except Exception as e:
-        print(f"[ingest worker] error processing pending: {e}")
+    print(
+        f"[worker] Starting consumption from stream '{STREAM}' in group '{GROUP}'")
 
-    # --- then process new messages as before (use '>') ---
     while True:
         try:
-            resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=BATCH_SIZE, block=BLOCK_MS)
-            if not resp:
-                await asyncio.sleep(0.1)
-                continue
+            # Read pending messages first
+            pending = await r.xreadgroup(GROUP, CONSUMER, {STREAM: "0"}, count=BATCH_SIZE)
+            if pending:
+                stream_key, messages = pending[0]
+                entries = [(msg_id, msg_data) for msg_id, msg_data in messages]
+                await process_batch(entries, r)
+                # Acknowledge messages
+                for msg_id, _ in entries:
+                    await r.xack(STREAM, GROUP, msg_id)
 
-            # resp is list of (stream, [(id, {field: value}), ...])
-            batch = []
-            ids_to_ack = []
-            for _stream, messages in resp:
-                for msg_id, fields in messages:
-                    raw = fields.get("data") or fields.get(b"data")
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        # move to DLQ
-                        await r.xadd(DLQ, {"payload": raw, "error": "invalid_json"})
-                        # still ack the bad message
-                        await r.xack(STREAM, GROUP, msg_id)
-                        continue
-                    batch.append((msg_id, payload))
-                    ids_to_ack.append(msg_id)
-
-            if batch:
-                # process in background (await so we can ack only when processed)
-                await process_batch(batch)
-                # ack processed ids
-                if ids_to_ack:
-                    await r.xack(STREAM, GROUP, *ids_to_ack)
+            # Read new messages
+            new = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=BATCH_SIZE, block=BLOCK_MS)
+            if new:
+                stream_key, messages = new[0]
+                entries = [(msg_id, msg_data) for msg_id, msg_data in messages]
+                await process_batch(entries, r)
+                # Acknowledge messages
+                for msg_id, _ in entries:
+                    await r.xack(STREAM, GROUP, msg_id)
 
         except Exception as e:
-            print(f"[ingest worker] error: {e}")
+            print(f"[worker] Error in consume loop: {e}")
             await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(consume_loop())
-    except KeyboardInterrupt:
-        print("Consumer stopped")
+    asyncio.run(consume_loop())

@@ -184,3 +184,93 @@ Contact / next improvements
 - Replace ORM bulk insert with COPY for higher throughput.
 - Add Prometheus metrics for stream lag and worker latencies.
 - Containerize worker and run under orchestration (Kubernetes / systemd) for reliability.
+
+## Integration guide — sending logs from your service
+
+This project exposes a lightweight ingest endpoint intended for producers to push logs quickly. Key references: [`app/routes/ingest.py`](app/routes/ingest.py), worker [`app/ingest/worker.py`](app/ingest/worker.py), and input schema [`schemas.LogCreate`](app/schemas.py).
+
+Summary
+
+- Preferred producer endpoint: POST /api/v1/ingest/ — accepts a JSON array or NDJSON lines of log objects.
+- Required fields per log item: level, message, service — and either app (name) or app_id. See [`schemas.LogCreate`](app/schemas.py).
+- Fast path: messages are enqueued to Redis Stream (REDIS_URL) and the API returns quickly.
+- Persistence: run the worker (python -m app.ingest.worker) to consume the stream and persist logs to the DB.
+- Fallback: if Redis is unavailable the API falls back to synchronous DB insert (bulk insert).
+
+CORS
+
+- Add your frontend/service origin(s) to CORS_ORIGINS in `.env` or update allowed origins in [`app/main.py`](app/main.py).
+
+Examples
+
+- Browser (fetch) — JSON array
+
+  ```javascript
+  const logs = [
+    { level: "INFO", message: "user clicked", service: "web", app: "frontend" }
+  ];
+
+  fetch("http://127.0.0.1:8000/api/v1/ingest/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(logs),
+  })
+    .then(r => r.json())
+    .then(console.log)
+    .catch(console.error);
+  ```
+
+- Browser (NDJSON)
+
+  ```javascript
+  const nd = [
+    JSON.stringify({ level:"INFO", message:"a", service:"web", app:"frontend" }),
+    JSON.stringify({ level:"ERROR", message:"b", service:"web", app:"frontend" })
+  ].join("\n");
+
+  fetch("http://127.0.0.1:8000/api/v1/ingest/", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-ndjson" },
+    body: nd
+  }).then(r=>r.json()).then(console.log);
+  ```
+
+- Node (httpx / axios / fetch) — example using node-fetch:
+
+  ```javascript
+  import fetch from 'node-fetch';
+  await fetch("http://127.0.0.1:8000/api/v1/ingest/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify([{ level:"INFO", message:"ok", service:"svc", app:"svc-name" }])
+  });
+  ```
+
+- Python (requests)
+
+  ```python
+  import requests
+  logs = [{"level":"INFO","message":"hi","service":"svc","app":"demo"}]
+  resp = requests.post("http://127.0.0.1:8000/api/v1/ingest/", json=logs)
+  print(resp.json())
+  ```
+
+- curl
+
+  ```bash
+  curl -X POST "http://127.0.0.1:8000/api/v1/ingest/" \
+    -H "Content-Type: application/json" \
+    -d '[{"level":"INFO","message":"demo log","service":"svc","app":"demo"}]'
+  ```
+
+Operational notes
+
+- To persist enqueued messages, run the worker: python -m app.ingest.worker (see [`app/ingest/worker.py`](app/ingest/worker.py)).
+- Inspect Redis streams with redis-cli (XLEN/XRANGE) or via the docker-compose demo in this repo.
+- Failed/invalid messages are moved to a DLQ stream (config in README and worker).
+- For production, add authentication (API key), rate-limiting, and consider idempotency (include an id in metadata_ if needed).
+
+If you want, I can:
+
+- Add an example integration for a specific framework (Express, Spring Boot, Go) or
+- Create a minimal React component that posts logs and polls stats.
